@@ -567,7 +567,7 @@ resource "docker_container" "inits" {
 
 locals {
   run_containers_map = {
-    for c in local.run_containers : c.image => c
+    for c in local.run_containers : c.name => c
   }
 }
 
