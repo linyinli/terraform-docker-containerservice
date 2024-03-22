@@ -576,9 +576,6 @@ resource "docker_image" "runs" {
 
   name         = local.run_containers_map[each.key].image
   keep_locally = true
-  pull_triggers = [
-    each.value.sha256_digest
-  ]
 }
 
 resource "terraform_data" "run_resources" {
