@@ -571,17 +571,10 @@ locals {
   }
 }
 
-data "docker_registry_image" "runs" {
+resource "docker_image" "runs" {
   for_each = toset(keys(try(nonsensitive(local.run_containers_map), local.run_containers_map)))
 
-  name                 = local.run_containers_map[each.key].image
-  insecure_skip_verify = true
-}
-
-resource "docker_image" "runs" {
-  for_each = data.docker_registry_image.runs
-
-  name         = each.value.name
+  name         = local.run_containers_map[each.key].image
   keep_locally = true
   pull_triggers = [
     each.value.sha256_digest
