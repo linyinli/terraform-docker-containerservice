@@ -368,13 +368,6 @@ resource "docker_container" "runs" {
       value = labels.value
     }
   }
-  dynamic "labels" {
-    for_each = local.unhealthy_restart ? [{}] : []
-    content {
-      label = local.unhealthy_restart_label
-      value = "true"
-    }
-  }
 
   ### configure execute.
   must_run    = true
