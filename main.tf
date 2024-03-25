@@ -326,10 +326,6 @@ resource "terraform_data" "run_executes" {
 resource "docker_container" "runs" {
   for_each = toset(keys(try(nonsensitive(local.run_containers_map), local.run_containers_map)))
 
-  ### configure shared ipc & network mode
-  ipc_mode     = "shareable"
-  network_mode = data.docker_network.network.id
-
   sysctls = try(var.deployment.sysctls != null, false) ? {
     for c in var.deployment.sysctls : c.name => c.value
   } : null
