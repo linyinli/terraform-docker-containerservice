@@ -238,18 +238,6 @@ resource "docker_volume" "ephemeral_volumes" {
   driver = "local"
 }
 
-## create pause docker container.
-
-data "docker_registry_image" "pause" {
-  name = var.infrastructure.pause_image
-}
-
-resource "docker_image" "pause" {
-  name = var.infrastructure.pause_image
-
-  keep_locally  = true
-  pull_triggers = [data.docker_registry_image.pause.sha256_digest]
-}
 
 locals {
   publish_ports = flatten([
@@ -261,118 +249,10 @@ locals {
   ])
 }
 
-resource "docker_container" "pause" {
-  name = join("-", [local.fullname, "pause"])
-  labels {
-    label = "walrus.seal.io/container-name"
-    value = "pause"
-  }
-  dynamic "labels" {
-    for_each = local.labels
-    content {
-      label = labels.key
-      value = labels.value
-    }
-  }
-
-  ### configure shared ipc.
-  ipc_mode = "shareable"
-  sysctls = try(var.deployment.sysctls != null, false) ? {
-    for c in var.deployment.sysctls : c.name => c.value
-  } : null
-  ### configure shared network.
-  hostname = local.name
-  host {
-    host = "host.docker.internal"
-    ip   = "host-gateway"
-  }
-  networks_advanced {
-    name = data.docker_network.network.id
-    aliases = [
-      join(".", [local.resource_name, local.namespace]),
-      join(".", [local.resource_name, local.namespace, "svc"]),
-      join(".", [local.resource_name, local.namespace, "svc", local.domain_suffix])
-    ]
-  }
-  dynamic "ports" {
-    for_each = try(nonsensitive(local.publish_ports), local.publish_ports)
-    content {
-      internal = ports.value.internal
-      external = ports.value.external
-      protocol = lower(ports.value.protocol)
-    }
-  }
-  ### configure execute.
-  image       = docker_image.pause.image_id
-  restart     = "always"
-  stdin_open  = anytrue([strcontains(docker_image.pause.name, "busybox"), strcontains(docker_image.pause.name, "alpine")])
-  memory_swap = 0
-}
-
-## create unhealthy restart docker container.
-
-locals {
-  unhealthy_restart = try(length([
-    for c in local.run_containers : c
-    if try(length(c.checks) > 0 && c.checks[0].teardown, false)
-  ]) > 0, false)
-  unhealthy_restart_label = format("walrus.seal.io/healthcheck-%s", local.fullname)
-}
-
-data "docker_registry_image" "unhealthy_restart" {
-  count = local.unhealthy_restart ? 1 : 0
-
-  name = var.infrastructure.unhealthy_restart_image
-}
-
-resource "docker_image" "unhealthy_restart" {
-  count = local.unhealthy_restart ? 1 : 0
-
-  name = var.infrastructure.unhealthy_restart_image
-
-  keep_locally  = true
-  pull_triggers = [data.docker_registry_image.unhealthy_restart[0].sha256_digest]
-}
-
-resource "docker_container" "unhealthy_restart" {
-  count = local.unhealthy_restart ? 1 : 0
-
-  name = join("-", [local.fullname, "unhealthy-restart"])
-  labels {
-    label = "walrus.seal.io/container-name"
-    value = "unhealthy-restart"
-  }
-
-  ### share from pause container.
-  ipc_mode     = local.pause_container
-  network_mode = local.pause_container
-
-  ### configure execute.
-  must_run = true
-  restart  = "always"
-  image    = docker_image.unhealthy_restart[0].image_id
-
-  ### configure resources.
-  shm_size = 64
-
-  ### configure environments.
-  env = [
-    "AUTOHEAL_CONTAINER_LABEL=${local.unhealthy_restart_label}"
-  ]
-
-  ### configure host mounts.
-  mounts {
-    type   = "bind"
-    source = "/var/run/docker.sock"
-    target = "/var/run/docker.sock"
-  }
-}
 
 ## create working docker containers.
 
 locals {
-  pause_container = format("container:%s", docker_container.pause.id)
-
   downward_environments = {
     "WALRUS_PROJECT_ID"       = local.project_id
     "WALRUS_ENVIRONMENT_ID"   = local.environment_id
@@ -408,162 +288,6 @@ locals {
   }
 }
 
-locals {
-  init_containers_map = {
-    for c in local.init_containers : c.name => c
-  }
-}
-
-data "docker_registry_image" "inits" {
-  for_each = toset(keys(try(nonsensitive(local.init_containers_map), local.init_containers_map)))
-
-  name                 = local.init_containers_map[each.key].image
-  insecure_skip_verify = true
-}
-
-resource "docker_image" "inits" {
-  for_each = data.docker_registry_image.inits
-
-  name         = each.value.name
-  keep_locally = true
-  pull_triggers = [
-    each.value.sha256_digest
-  ]
-}
-
-resource "docker_container" "inits" {
-  for_each = toset(keys(try(nonsensitive(local.init_containers_map), local.init_containers_map)))
-
-  name = join("-", [local.fullname, each.key])
-  labels {
-    label = "walrus.seal.io/container-name"
-    value = each.key
-  }
-  dynamic "labels" {
-    for_each = local.labels
-    content {
-      label = labels.key
-      value = labels.value
-    }
-  }
-
-  ### share from pause container.
-  ipc_mode     = local.pause_container
-  network_mode = local.pause_container
-
-  ### configure execute.
-  must_run    = false
-  restart     = "on-failure"
-  image       = docker_image.inits[each.key].image_id
-  working_dir = try(local.init_containers_map[each.key].execute.working_dir, null)
-  entrypoint  = try(local.init_containers_map[each.key].execute.command, null)
-  command     = try(local.init_containers_map[each.key].execute.args, null)
-  read_only   = try(local.init_containers_map[each.key].execute.readonly_rootfs, false)
-  user = try(local.init_containers_map[each.key].execute.as_user != null, false) ? join(":", compact([
-    local.init_containers_map[each.key].execute.as_user,
-    try(local.init_containers_map[each.key].execute.as_group, null)
-  ])) : null
-  group_add = try(var.deployment.fs_group != null, false) ? compact([
-    try(local.init_containers_map[each.key].execute.as_user == null && local.init_containers_map[each.key].execute.as_group != null, false) ? local.init_containers_map[each.key].execute.as_group : null,
-    try(var.deployment.fs_group, null)
-  ]) : null
-  privileged = try(local.init_containers_map[each.key].execute.privileged, null)
-
-  ### configure resources.
-  shm_size    = 64
-  cpu_shares  = try(local.init_containers_map[each.key].resources != null && local.init_containers_map[each.key].resources.cpu > 0, false) ? ceil(1024 * local.init_containers_map[each.key].resources.cpu) : null
-  memory      = try(local.init_containers_map[each.key].resources != null && local.init_containers_map[each.key].resources.memory > 0, false) ? local.init_containers_map[each.key].resources.memory : null
-  memory_swap = try(local.init_containers_map[each.key].resources != null && local.init_containers_map[each.key].resources.memory > 0, false) ? local.init_containers_map[each.key].resources.memory : 0
-  gpus        = try(local.init_containers_map[each.key].resources != null && local.init_containers_map[each.key].resources.gpus > 0, false) ? "all" : null # only all is supported at present.
-
-  ### configure environments.
-  env = [
-    for k, v in merge(
-      {
-        for e in try(local.container_ephemeral_envs_map[each.key], []) : e.name => e.value
-      },
-      {
-        for e in try(local.container_refer_envs_map[each.key], []) : e.name => e.value_refer.params.name
-      },
-      local.downward_environments
-    ) : format("%s=%s", k, v)
-  ]
-
-  ### configure ephemeral files.
-  dynamic "mounts" {
-    for_each = try(try(nonsensitive(local.container_mapping_ephemeral_files_map[each.key].changed), local.container_mapping_ephemeral_files_map[each.key].changed), [])
-    content {
-      type      = "bind"
-      source    = abspath(local_file.ephemeral_files[mounts.value.name].filename)
-      target    = mounts.value.path
-      read_only = try(anytrue([floor(tonumber(mounts.value.mode) / 100) % 2 != 1, floor(tonumber(mounts.value.mode) / 10) % 2 != 1, tonumber(mounts.value.mode) % 2 != 1]), true)
-    }
-  }
-  dynamic "upload" {
-    for_each = try(try(nonsensitive(local.container_mapping_ephemeral_files_map[each.key].no_changed), local.container_mapping_ephemeral_files_map[each.key].no_changed), [])
-    content {
-      source     = abspath(local_file.ephemeral_files[upload.value.name].filename)
-      file       = upload.value.path
-      executable = try(floor(tonumber(upload.value.mode) / 100) % 2 == 1, false)
-    }
-  }
-
-  ### configure refer files.
-  dynamic "mounts" {
-    for_each = try(try(nonsensitive(local.container_mapping_refer_files_map[each.key].changed), local.container_mapping_refer_files_map[each.key].changed), [])
-    content {
-      type      = "bind"
-      source    = abspath(mounts.value.content_refer.params.path)
-      target    = mounts.value.path
-      read_only = try(anytrue([floor(tonumber(mounts.value.mode) / 100) % 2 != 1, floor(tonumber(mounts.value.mode) / 10) % 2 != 1, tonumber(mounts.value.mode) % 2 != 1]), true)
-    }
-  }
-  dynamic "upload" {
-    for_each = try(try(nonsensitive(local.container_mapping_refer_files_map[each.key].no_changed), local.container_mapping_refer_files_map[each.key].no_changed), [])
-    content {
-      source     = abspath(upload.value.content_refer.params.path)
-      file       = upload.value.path
-      executable = try(floor(tonumber(upload.value.mode) / 100) % 2 == 1, false)
-    }
-  }
-
-  ### configure ephemeral mounts.
-  dynamic "mounts" {
-    for_each = try(try(nonsensitive(local.container_ephemeral_mounts_map[each.key]), local.container_ephemeral_mounts_map[each.key]), [])
-    content {
-      type      = "volume"
-      source    = docker_volume.ephemeral_volumes[mounts.value.name].name
-      target    = mounts.value.path
-      read_only = try(mounts.value.readonly, false)
-      # sub_path  = try(mounts.value.subpath, null) # NB(thxCode): block by https://github.com/moby/moby/pull/45687.
-    }
-  }
-
-  ### configure refer mounts.
-  dynamic "mounts" {
-    for_each = try(try(nonsensitive(local.container_refer_mounts_map[each.key]), local.container_refer_mounts_map[each.key]), [])
-    content {
-      type      = "volume"
-      source    = mounts.value.volume_refer.params.name
-      target    = mounts.value.path
-      read_only = try(mounts.value.readonly, false)
-      # sub_path  = try(mounts.value.subpath, null) # NB(thxCode): block by https://github.com/moby/moby/pull/45687.
-    }
-  }
-
-  depends_on = [
-    docker_container.pause
-  ]
-  lifecycle {
-    postcondition {
-      condition     = try(self.exit_code == null || self.exit_code == 0, true)
-      error_message = "Init container must exit with code 0"
-    }
-    replace_triggered_by = [
-      docker_container.pause
-    ]
-  }
-}
 
 locals {
   run_containers_map = {
@@ -602,7 +326,37 @@ resource "terraform_data" "run_executes" {
 resource "docker_container" "runs" {
   for_each = toset(keys(try(nonsensitive(local.run_containers_map), local.run_containers_map)))
 
-  name = join("-", [local.fullname, each.key])
+  ### configure shared ipc & network mode
+  ipc_mode     = "shareable"
+  network_mode = data.docker_network.network.id
+
+  sysctls = try(var.deployment.sysctls != null, false) ? {
+    for c in var.deployment.sysctls : c.name => c.value
+  } : null
+  ### configure shared network.
+  hostname = local.name
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
+  networks_advanced {
+    name = data.docker_network.network.id
+    aliases = [
+      join(".", [local.resource_name, local.namespace]),
+      join(".", [local.resource_name, local.namespace, "svc"]),
+      join(".", [local.resource_name, local.namespace, "svc", local.domain_suffix])
+    ]
+  }
+  dynamic "ports" {
+    for_each = try(nonsensitive(local.publish_ports), local.publish_ports)
+    content {
+      internal = ports.value.internal
+      external = ports.value.external
+      protocol = lower(ports.value.protocol)
+    }
+  }
+
+  name = local.resource_name
   labels {
     label = "walrus.seal.io/container-name"
     value = each.key
@@ -621,10 +375,6 @@ resource "docker_container" "runs" {
       value = "true"
     }
   }
-
-  ### share from pause container.
-  ipc_mode     = local.pause_container
-  network_mode = local.pause_container
 
   ### configure execute.
   must_run    = true
@@ -756,13 +506,8 @@ resource "docker_container" "runs" {
     }
   }
 
-  depends_on = [
-    docker_container.pause,
-    docker_container.inits
-  ]
   lifecycle {
     replace_triggered_by = [
-      docker_container.pause,
       terraform_data.run_resources[each.key],
       terraform_data.run_checks[each.key],
       terraform_data.run_executes[each.key]
